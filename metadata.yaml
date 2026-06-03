@@ -4,7 +4,7 @@ author: 你的名字
 version: 1.0.0
 desc: 查询EVE Online市场价格和订单信息
 short_desc: 查询EVE市场价格
-repo: 你的仓库地址
+repo: https://github.com/1420084075cold-arch/astrbot_plugin_NSGY_EVEmarket.git
 support_platforms:
   - aiocqhttp
   - telegram
