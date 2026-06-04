@@ -1,6 +1,6 @@
 name: astrbot_plugin_eve_market
 display_name: astrbot_plugin_NSGY_EVEmarket
-author: 你的名字
+author: BeiMu
 version: 1.0.0
 desc: 查询EVE Online市场价格和订单信息
 short_desc: 查询EVE市场价格
