@@ -107,31 +107,37 @@ class EveMarketPlugin(Star):
             logger.error(f"查询失败: {e}")
             yield event.plain_result(f"查询失败: {str(e)}\n请检查物品名称是否正确")
     
-    async def _get_type_id(self, item_name: str) -> int:
-        """搜索物品ID"""
-        async with aiohttp.ClientSession() as session:
-            # 尝试中文搜索
-            url = f"{self.base_url}/universe/search/"
-            params = {
-                "categories": "inventory_type",
-                "search": item_name,
-                "language": "zh"
-            }
-            try:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        types = data.get('inventory_type', [])
-                        if types:
-                            return types[0]
-                    elif resp.status == 404:
-                        return None
+  async def _get_type_id(self, item_name: str) -> int:
+    """搜索物品ID，现在支持中英文了！"""
+    async with aiohttp.ClientSession() as session:
+        # 这里的核心技巧是设置 language="zh"，让EVE官方服务器帮我们做翻译和匹配
+        url = f"{self.base_url}/universe/search/"
+        params = {
+            "categories": "inventory_type",
+            "search": item_name,
+            "language": "zh",  # 请求中文结果，这样“PLEX”也能匹配到正确的物品
+            "strict": "false"  # 模糊搜索，提高容错率
+        }
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    types = data.get('inventory_type', [])
+                    if types:
+                        # 找到了就返回第一个（通常是最佳匹配）
+                        found_id = types[0]
+                        logger.info(f"物品 '{item_name}' 匹配到ID: {found_id}")
+                        return found_id
                     else:
-                        logger.error(f"ESI搜索失败: HTTP {resp.status}")
+                        # 如果没找到，给你个更友好的提示
+                        logger.warning(f"未找到物品 '{item_name}'")
                         return None
-            except Exception as e:
-                logger.error(f"搜索物品ID异常: {e}")
-                return None
+                else:
+                    logger.error(f"ESI搜索失败: HTTP {resp.status}")
+                    return None
+        except Exception as e:
+            logger.error(f"搜索物品ID时出错: {e}")
+            return None
     
     async def _get_market_orders(self, region_id: int, type_id: int) -> list:
         """获取市场订单"""
