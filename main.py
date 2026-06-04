@@ -154,7 +154,7 @@ class MyPlugin(Star):
         type_id, min_sell, max_buy = get_jita_price_by_name(item_name)
         if not type_id:
             yield event.plain_result(f"未找到该物品，请确认名称是否正确。")
-            else:
+        else:
         print(f"物品: {item_name} (type_id={type_id})")
         if min_sell is None and max_buy is None:
             yield event.plain_result(f"在 Jita 当前没有订单。")
