@@ -11,32 +11,25 @@ class EveMarketPlugin(Star):
         super().__init__(context)
     
     REGION_ID_FORGE = 10000002
+    REGION_ID_PLEX_GLOBAL = 19000001
     SYSTEM_ID_JITA = 30000142
     ESI_BASE = "https://esi.evetech.net/latest"
     
-    # 中文到英文的常见物品映射
+    PLEX_TYPE_ID = 44992
+    
+    # 中英文映射
     CN_TO_EN = {
         "三钛合金": "Tritanium",
         "类晶体胶矿": "Mexallon",
-        "类银超金属": "Pyerite", 
+        "类银超金属": "Pyerite",
         "同位聚合体": "Isogen",
         "超新星诺克石": "Nocxium",
         "晶状石英核岩": "Megacyte",
         "超噬矿": "Zydrine",
         "伊甸币": "Plex",
         "狂怒者级": "Vexor",
-        "刺客级": "Stiletto",
-        "裂谷级": "Rifter",
-        "主宰级": "Dominix",
-        "灾难级": "Apocalypse",
-        "乌鸦级": "Raven",
-        "幼龙级": "Drake",
         "毒蜥级": "Gila",
         "伊什塔级": "Ishtar",
-        "夜魔侠级": "Daredevil",
-        # 矿物
-        "莫尔石": "Morphite",
-        # 脑插系列
         "圣光": "Saint",
         "护符": "Talisman",
         "水晶": "Crystal",
@@ -45,6 +38,16 @@ class EveMarketPlugin(Star):
         "九头蛇": "Hydra",
         "阿斯克雷": "Asklepian",
     }
+    
+    # 脑插级别
+    IMPLANT_GRADES = {
+        "阿尔法": "Alpha",
+        "贝它": "Beta",
+        "伽玛": "Gamma",
+        "德尔塔": "Delta",
+        "伊普西隆": "Epsilon",
+        "欧米伽": "Omega",
+    }
 
     async def initialize(self):
         logger.info("EVE Market 插件已加载")
@@ -52,7 +55,7 @@ class EveMarketPlugin(Star):
     async def terminate(self):
         logger.info("EVE Market 插件已卸载")
 
-    # ==================== 搜索功能 ====================
+    # ==================== 核心查询方法 ====================
     
     def get_type_id(self, name: str) -> Optional[int]:
         """获取物品 Type ID"""
@@ -86,45 +89,97 @@ class EveMarketPlugin(Star):
         return []
 
     def smart_search(self, keyword: str) -> Tuple[Optional[int], Optional[str], List[Tuple[int, str]]]:
-        """智能搜索：支持中文、英文、模糊匹配"""
+        """智能搜索：支持中文、英文、脑插、模糊匹配"""
         keyword = keyword.strip()
         
-        # 1. 检查中文映射表
+        # 1. PLEX
+        if keyword.lower() in ["plex", "伊甸币"]:
+            return self.PLEX_TYPE_ID, "PLEX", []
+        
+        # 2. 脑插处理（如：圣光阿尔法型、圣光-阿尔法型、'Saint' Alpha）
+        for cn_series, en_series in self.CN_TO_EN.items():
+            for cn_grade, en_grade in self.IMPLANT_GRADES.items():
+                # 中文格式：圣光阿尔法型、圣光-阿尔法型
+                if keyword in [f"{cn_series}{cn_grade}型", f"{cn_series}-{cn_grade}型"]:
+                    en_name = f"'{en_series}' {en_grade}"
+                    type_id = self.get_type_id(en_name)
+                    if type_id:
+                        return type_id, f"{cn_series}{cn_grade}型", []
+        
+        # 3. 直接搜索英文脑插格式：'Saint' Alpha
+        match = re.match(r"^'(.+)'\s+(Alpha|Beta|Gamma|Delta|Epsilon|Omega)$", keyword)
+        if match:
+            type_id = self.get_type_id(keyword)
+            if type_id:
+                return type_id, keyword, []
+        
+        # 4. 中文映射
         if keyword in self.CN_TO_EN:
             en_name = self.CN_TO_EN[keyword]
             type_id = self.get_type_id(en_name)
             if type_id:
                 return type_id, en_name, []
         
-        # 2. 脑插特殊处理
-        if keyword in ["圣光", "护符", "水晶", "蝰蛇", "强势", "九头蛇", "阿斯克雷"]:
-            en_name = self.CN_TO_EN[keyword]
-            # 尝试查询阿尔法型作为代表
-            test_name = f"'{en_name}' Alpha"
-            type_id = self.get_type_id(test_name)
-            if type_id:
-                return type_id, f"{keyword}系列", []
-        
-        # 3. 直接搜索
+        # 5. 直接搜索
         type_id = self.get_type_id(keyword)
         if type_id:
             return type_id, keyword, []
         
-        # 4. 尝试中英文组合
-        for cn, en in self.CN_TO_EN.items():
-            if cn in keyword or keyword in cn:
-                type_id = self.get_type_id(en)
-                if type_id:
-                    return type_id, en, []
-        
-        # 5. 模糊搜索
+        # 6. 模糊搜索
         results = self.search_fuzzy(keyword)
         if results:
             return results[0][0], results[0][1], results
         
         return None, None, []
 
-    def get_price(self, type_id: int) -> Tuple[Optional[float], Optional[float]]:
+    def get_price(self, type_id: int) -> Tuple[Optional[float], Optional[float], bool]:
+        """获取价格，返回 (卖价, 买价, 是否为PLEX)"""
+        # PLEX 使用全球市场
+        if type_id == self.PLEX_TYPE_ID:
+            return self.get_plex_price(), True
+        
+        # 普通物品使用 Jita
+        return self.get_jita_price(type_id), False
+
+    def get_plex_price(self) -> Tuple[Optional[float], Optional[float]]:
+        """获取 PLEX 全球市场价格"""
+        sell_prices = []
+        buy_prices = []
+        page = 1
+        
+        while True:
+            url = f"{self.ESI_BASE}/markets/{self.REGION_ID_PLEX_GLOBAL}/orders/"
+            params = {"page": page, "type_id": self.PLEX_TYPE_ID}
+            
+            try:
+                resp = requests.get(url, params=params, timeout=15)
+                if resp.status_code != 200:
+                    break
+                orders = resp.json()
+                if not orders:
+                    break
+                
+                for order in orders:
+                    price = order["price"]
+                    if order["is_buy_order"]:
+                        buy_prices.append(price)
+                    else:
+                        sell_prices.append(price)
+                
+                if "X-Pages" in resp.headers:
+                    total_pages = int(resp.headers["X-Pages"])
+                    if page >= total_pages:
+                        break
+                page += 1
+            except Exception as e:
+                logger.error(f"获取PLEX订单失败: {e}")
+                break
+        
+        min_sell = min(sell_prices) if sell_prices else None
+        max_buy = max(buy_prices) if buy_prices else None
+        return min_sell, max_buy
+
+    def get_jita_price(self, type_id: int) -> Tuple[Optional[float], Optional[float]]:
         """获取 Jita 市场价格"""
         sell_prices = []
         buy_prices = []
@@ -138,7 +193,6 @@ class EveMarketPlugin(Star):
                 resp = requests.get(url, params=params, timeout=15)
                 if resp.status_code != 200:
                     break
-                    
                 orders = resp.json()
                 if not orders:
                     break
@@ -146,7 +200,6 @@ class EveMarketPlugin(Star):
                 for order in orders:
                     if order.get("system_id") != self.SYSTEM_ID_JITA:
                         continue
-                    
                     price = order["price"]
                     if order["is_buy_order"]:
                         buy_prices.append(price)
@@ -158,16 +211,15 @@ class EveMarketPlugin(Star):
                     if page >= total_pages:
                         break
                 page += 1
-                
             except Exception as e:
-                logger.error(f"获取订单失败: {e}")
+                logger.error(f"获取Jita订单失败: {e}")
                 break
         
         min_sell = min(sell_prices) if sell_prices else None
         max_buy = max(buy_prices) if buy_prices else None
         return min_sell, max_buy
 
-    def parse_quantity(self, input_str: str) -> Tuple[str, int]:
+    def parse_input(self, input_str: str) -> Tuple[str, int]:
         """解析物品名称和数量"""
         input_str = input_str.strip()
         
@@ -192,18 +244,19 @@ class EveMarketPlugin(Star):
     
     @filter.command(".jita")
     async def jita(self, event: AstrMessageEvent, content: str = ""):
-        """查询 Jita 市场价格（支持中文和数量）
+        """查询 Jita 市场价格
         
-        用法: .jita [物品名]
-              .jita [物品名] x[数量]
-              .jita [数量] [物品名]
+        支持: 中英文物品、脑插、PLEX、数量计算、模糊搜索
         
         示例:
             .jita 三钛合金
             .jita 狂怒者级
+            .jita PLEX
             .jita PLEX x100
             .jita 100 三钛合金
-            .jita 圣光
+            .jita 圣光阿尔法型
+            .jita 'Saint' Alpha
+            .jita 九头蛇欧米伽型
         """
         if not content:
             yield event.plain_result(
@@ -211,22 +264,24 @@ class EveMarketPlugin(Star):
                 "用法: .jita [物品名]\n"
                 "      .jita [物品名] x[数量]\n\n"
                 "📖 示例:\n"
-                "  .jita 三钛合金\n"
-                "  .jita 狂怒者级\n"
-                "  .jita PLEX x100\n"
-                "  .jita 100 三钛合金\n"
-                "  .jita 圣光\n\n"
-                "💡 支持中英文名称，支持数量计算"
+                "  【矿物】.jita 三钛合金\n"
+                "  【舰船】.jita 狂怒者级\n"
+                "  【PLEX】.jita PLEX\n"
+                "  【批量】.jita PLEX x100\n"
+                "  【脑插】.jita 圣光阿尔法型\n"
+                "  【脑插】.jita 'Saint' Alpha\n\n"
+                "💡 支持中英文名称，自动识别 PLEX 和脑插"
             )
             return
         
         # 解析数量
-        item_name, quantity = self.parse_quantity(content)
+        item_name, quantity = self.parse_input(content)
         
         if not item_name:
             yield event.plain_result("❌ 请提供物品名称")
             return
         
+        # 显示搜索提示
         yield event.plain_result(f"🔍 正在查询「{item_name}」...")
         
         # 智能搜索
@@ -244,29 +299,54 @@ class EveMarketPlugin(Star):
                 yield event.plain_result(
                     f"❌ 未找到「{item_name}」\n\n"
                     f"💡 尝试:\n"
-                    f"  - 使用英文名称: .jita Tritanium\n"
-                    f"  - 使用常见中文名: .jita 三钛合金\n"
-                    f"  - 舰船示例: .jita 狂怒者级"
+                    f"  - 矿物: .jita 三钛合金\n"
+                    f"  - 舰船: .jita 狂怒者级\n"
+                    f"  - 脑插: .jita 圣光阿尔法型\n"
+                    f"  - 英文: .jita Tritanium"
                 )
             return
         
         # 获取价格
-        sell, buy = self.get_price(type_id)
+        (sell, buy), is_plex = self.get_price(type_id)
         
         if sell is None and buy is None:
-            yield event.plain_result(f"「{actual_name}」在 Jita 没有公开订单")
+            if is_plex:
+                yield event.plain_result(f"PLEX 全球市场当前没有订单，请稍后再试")
+            else:
+                yield event.plain_result(f"「{actual_name}」在 Jita 没有公开订单")
             return
         
         # 计算总价
         total_sell = sell * quantity if sell else None
         total_buy = buy * quantity if buy else None
         
+        # 判断是否是脑插（用于显示插槽）
+        is_implant = False
+        implant_slot = ""
+        for cn_grade in self.IMPLANT_GRADES.keys():
+            if cn_grade in actual_name:
+                is_implant = True
+                slot_map = {"阿尔法": "1号(感知)", "贝它": "2号(记忆)", "伽玛": "3号(毅力)", 
+                           "德尔塔": "4号(智力)", "伊普西隆": "5号(魅力)", "欧米伽": "6号(套装)"}
+                implant_slot = slot_map.get(cn_grade, "")
+                break
+        
         # 构建返回消息
-        result_parts = [
-            "📍 **Jita 市场**",
-            f"📦 **{actual_name}**" + (f" x {quantity}" if quantity > 1 else ""),
-            "",
-        ]
+        if is_plex:
+            result_parts = [
+                "🌍 **PLEX 全球市场**",
+                f"📦 **PLEX**" + (f" x {quantity}" if quantity > 1 else ""),
+                "",
+            ]
+        else:
+            market_name = "Jita 市场"
+            result_parts = [
+                f"📍 **{market_name}**",
+                f"📦 **{actual_name}**" + (f" x {quantity}" if quantity > 1 else ""),
+            ]
+            if is_implant and implant_slot:
+                result_parts.append(f"🔌 插槽: {implant_slot}")
+            result_parts.append("")
         
         if total_sell:
             result_parts.append(f"💰 最低卖价: {total_sell:,.2f} ISK")
@@ -285,34 +365,47 @@ class EveMarketPlugin(Star):
         if sell and buy:
             spread = sell - buy
             spread_pct = (spread / buy) * 100
-            result_parts.append(f"📊 买卖差价: {spread:,.2f} ISK ({spread_pct:.1f}%)")
+            result_parts.append(f"📊 差价: {spread:,.2f} ISK ({spread_pct:.1f}%)")
+        
+        # 脑插套装提示
+        if is_implant and "欧米伽" not in actual_name:
+            for cn_series, en_series in self.CN_TO_EN.items():
+                if cn_series in actual_name or en_series in actual_name:
+                    result_parts.append(f"\n💡 查询全套: .jita {cn_series}系列")
+                    break
         
         yield event.plain_result("\n".join(result_parts))
 
     @filter.command(".jitaid")
     async def jita_by_id(self, event: AstrMessageEvent, type_id_str: str):
-        """通过 Type ID 查询价格
-        
-        用法: .jitaid [TypeID]
-        示例: .jitaid 34
-        """
+        """通过 Type ID 查询价格"""
         try:
             type_id = int(type_id_str.strip())
         except ValueError:
             yield event.plain_result("❌ 请提供正确的 Type ID 数字")
             return
         
-        sell, buy = self.get_price(type_id)
+        (sell, buy), is_plex = self.get_price(type_id)
         
         if sell is None and buy is None:
-            yield event.plain_result(f"Type ID {type_id} 在 Jita 没有订单")
+            if is_plex:
+                yield event.plain_result(f"PLEX (ID: {type_id}) 全球市场没有订单")
+            else:
+                yield event.plain_result(f"Type ID {type_id} 在 Jita 没有订单")
             return
         
-        result_parts = [
-            "📍 **Jita 市场**",
-            f"📦 **Type ID: {type_id}**",
-            "",
-        ]
+        if is_plex:
+            result_parts = [
+                "🌍 **PLEX 全球市场**",
+                f"📦 **Type ID: {type_id} (PLEX)**",
+                "",
+            ]
+        else:
+            result_parts = [
+                "📍 **Jita 市场**",
+                f"📦 **Type ID: {type_id}**",
+                "",
+            ]
         
         if sell:
             result_parts.append(f"💰 最低卖价: {sell:,.2f} ISK")
@@ -322,6 +415,6 @@ class EveMarketPlugin(Star):
         if sell and buy:
             spread = sell - buy
             spread_pct = (spread / buy) * 100
-            result_parts.append(f"📊 买卖差价: {spread:,.2f} ISK ({spread_pct:.1f}%)")
+            result_parts.append(f"📊 差价: {spread:,.2f} ISK ({spread_pct:.1f}%)")
         
         yield event.plain_result("\n".join(result_parts))
