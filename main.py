@@ -1,538 +1,292 @@
 import aiohttp
-import os
 import json
-from typing import Dict, Any, List, Optional
-from dataclasses import dataclass
+import asyncio
 from datetime import datetime
+from typing import List, Dict, Optional, Tuple
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.star import Context, Star, register
+from astrbot.api import logger
 
-from astrbot.api.all import (
-    AstrMessageEvent,
-    Command,
-    Context,
-    MessageEventResult,
-    Plain,
-    MessageChain,
-)
-from astrbot.api.plugin import Plugin, PluginMetadata
+# 欧服 ESI API 基础地址
+ESI_BASE_URL = "https://esi.evetech.net/latest"
 
-# ============================================
-# 第一部分：插件元数据
-# ============================================
-metadata = PluginMetadata(
-    name="EVE市场查询",           # 插件名称
-    description="查询EVE Online市场物品价格信息，支持代理",  # 插件描述
-    author="YourName",            # 作者
-    version="1.0.0",              # 版本号
-)
+# 常用贸易中心（市场枢纽）的 Region ID 和中文名映射
+# 来源: ESI /universe/regions/ 接口
+TRADE_HUBS = {
+    "吉他": 10000002,      # The Forge (Jita)
+    "多迪谢": 10000001,    # Domain (Amarr)
+    "俄萨": 10000043,      # Metropolis (Hek)
+    "勒金斯": 10000032,    # Sinq Laison (Rens)
+    "艾玛": 10000001,      # Domain (Amarr 同区域)
+    "伊甸": 10000068,      # The Citadel (Perimeter/TTT)
+}
 
-
-# ============================================
-# 第二部分：数据类定义
-# ============================================
-@dataclass
-class MarketOrder:
-    """市场订单数据类"""
-    item_name: str      # 物品名称
-    order_type: str     # 订单类型：buy/sell
-    price: float        # 价格
-    volume: int         # 数量
-    location: str       # 地点
-    range: str          # 范围
-    remaining: int      # 剩余数量
+# 部分常用物品的名称->type_id 映射（便于演示，实际应用中可扩展为数据库或 ESI 搜索）
+# 完整实现建议使用 ESI /universe/types/ 接口的 /universe/ids/ 或 /universe/search/
+COMMON_ITEMS = {
+    "plex": 29668,          # PLEX
+    "注射器": 40540,        # Large Skill Injector
+    "伊甸币": 47479,        # Edencom Survey Data (简化)
+}
 
 
-# ============================================
-# 第三部分：EVE API接口类
-# ============================================
-class EVEMarketAPI:
-    """EVE市场API接口类，负责与EVE Online服务器通信"""
-    
-    BASE_URL = "https://esi.evetech.net/latest"  # EVE API基础地址
-    
-    def __init__(self, proxy_url: str = None):
-        """
-        初始化API接口
-        Args:
-            proxy_url: 代理地址，如 "http://127.0.0.1:7890"
-        """
-        self.session = None
-        self.proxy_url = proxy_url
-    
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """获取或创建HTTP会话"""
+class EveMarketPlugin(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+        self.session: Optional[aiohttp.ClientSession] = None
+        # 结果缓存（简单内存缓存，生产环境建议使用持久化）
+        self.cache: Dict[str, Tuple[Dict, float]] = {}
+        self.cache_ttl = 60  # 缓存 60 秒
+
+    async def get_session(self) -> aiohttp.ClientSession:
+        """获取或创建 aiohttp session"""
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=30)
             self.session = aiohttp.ClientSession(
                 headers={
-                    "User-Agent": "AstrBot-EVE-Market-Plugin/1.0",
-                    "Accept": "application/json"
-                },
-                timeout=timeout
+                    "User-Agent": "AstrBot EVE Market Plugin/1.0 (Contact: Your@email.com)"
+                }
             )
         return self.session
-    
-    async def search_item(self, item_name: str) -> Optional[Dict[str, Any]]:
-        """
-        搜索物品并返回物品信息
-        Args:
-            item_name: 物品名称
-        Returns:
-            物品信息字典，包含type_id和name等
-        """
-        session = await self._get_session()
-        
-        # 第一步：搜索物品ID
-        search_url = f"{self.BASE_URL}/search/"
-        search_params = {
-            "categories": "inventory_type",
-            "search": item_name,
-            "strict": "false"
-        }
-        
-        try:
-            async with session.get(
-                search_url, 
-                params=search_params, 
-                proxy=self.proxy_url
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if "inventory_type" in data and data["inventory_type"]:
-                        # 第二步：获取第一个匹配物品的详细信息
-                        type_id = data["inventory_type"][0]
-                        return await self._get_item_info(type_id)
-        except Exception as e:
-            print(f"搜索物品失败: {e}")
-        return None
-    
-    async def _get_item_info(self, type_id: int) -> Optional[Dict[str, Any]]:
-        """获取物品详细信息"""
-        session = await self._get_session()
-        url = f"{self.BASE_URL}/universe/types/{type_id}/"
-        
-        try:
-            async with session.get(url, proxy=self.proxy_url) as response:
-                if response.status == 200:
-                    return await response.json()
-        except Exception as e:
-            print(f"获取物品信息失败: {e}")
-        return None
-    
-    async def get_market_orders(
-        self, 
-        region_id: int, 
-        type_id: int, 
-        order_type: str = "all"
-    ) -> List[MarketOrder]:
-        """
-        获取市场订单
-        Args:
-            region_id: 星域ID
-            type_id: 物品类型ID
-            order_type: 订单类型，"buy"、"sell"或"all"
-        Returns:
-            市场订单列表
-        """
-        session = await self._get_session()
-        url = f"{self.BASE_URL}/markets/{region_id}/orders/"
-        params = {"type_id": type_id}
-        
-        # 如果指定了订单类型，添加参数
-        if order_type != "all":
-            params["order_type"] = order_type
-        
-        try:
-            async with session.get(
-                url, 
-                params=params, 
-                proxy=self.proxy_url
-            ) as response:
-                if response.status == 200:
-                    orders_data = await response.json()
-                    return await self._process_orders(orders_data)
-        except Exception as e:
-            print(f"获取市场订单失败: {e}")
-        return []
-    
-    async def _process_orders(self, orders_data: List[Dict]) -> List[MarketOrder]:
-        """处理原始订单数据，转换为MarketOrder对象"""
-        orders = []
-        location_cache = {}  # 位置名称缓存
-        
-        for order in orders_data[:20]:  # 只处理前20个订单
-            location_id = order.get("location_id")
-            
-            # 获取位置名称（使用缓存）
-            if location_id not in location_cache:
-                location_name = await self._get_location_name(location_id)
-                location_cache[location_id] = location_name
-            else:
-                location_name = location_cache[location_id]
-            
-            # 判断订单类型
-            is_buy_order = order.get("is_buy_order", False)
-            order_type = "buy" if is_buy_order else "sell"
-            
-            market_order = MarketOrder(
-                item_name="",  # 稍后填充
-                order_type=order_type,
-                price=order.get("price", 0),
-                volume=order.get("volume_total", 0),
-                location=location_name,
-                range=order.get("range", "station"),
-                remaining=order.get("volume_remain", 0)
-            )
-            orders.append(market_order)
-        
-        return orders
-    
-    async def _get_location_name(self, location_id: int) -> str:
-        """获取位置名称（空间站名称）"""
-        session = await self._get_session()
-        
-        # 先尝试查询空间站
-        url = f"{self.BASE_URL}/universe/stations/{location_id}/"
-        try:
-            async with session.get(url, proxy=self.proxy_url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get("name", f"Station-{location_id}")
-        except:
-            pass
-        
-        # 如果不是空间站，返回ID
-        return f"Location-{location_id}"
-    
-    async def close(self):
-        """关闭HTTP会话"""
+
+    async def close_session(self):
+        """关闭 aiohttp session"""
         if self.session and not self.session.closed:
             await self.session.close()
 
-
-# ============================================
-# 第四部分：主插件类
-# ============================================
-class EVEMarketPlugin(Plugin):
-    """EVE市场查询主插件类"""
-    
-    # 常用星域ID映射表
-    REGIONS = {
-        "吉他": 10000002,    # The Forge
-        "艾玛": 10000043,    # Domain
-        "加达里": 10000014,  # Lonetrek
-        "米玛塔尔": 10000030,  # Heimatar
-        "盖伦特": 10000037,  # Essence
-    }
-    
-    def __init__(self, context: Context):
+    async def search_type_id(self, item_name: str) -> Optional[int]:
         """
-        插件初始化
-        Args:
-            context: AstrBot上下文
+        通过 ESI 搜索物品 ID
+        GET /universe/search/?search={name}&categories=inventory_type
         """
-        super().__init__(context)
-        
-        # 加载配置
-        config = self._load_config()
-        
-        # 设置代理
-        proxy_url = None
-        if config.get("proxy", {}).get("enabled", False):
-            proxy_url = config["proxy"]["url"]
-            print(f"[EVE插件] 使用代理: {proxy_url}")
-        
-        # 初始化API接口
-        self.market_api = EVEMarketAPI(proxy_url=proxy_url)
-    
-    def _load_config(self) -> Dict:
-        """加载配置文件"""
-        config_path = os.path.join(
-            os.path.dirname(__file__), 
-            'eve_market_config.json'
-        )
-        
-        default_config = {
-            "proxy": {
-                "enabled": False,
-                "url": "http://127.0.0.1:7890",
-                "type": "http"
+        try:
+            session = await self.get_session()
+            url = f"{ESI_BASE_URL}/universe/search/"
+            params = {
+                "search": item_name,
+                "categories": "inventory_type",
+                "strict": "true",
+                "language": "zh"
             }
-        }
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("inventory_type") and len(data["inventory_type"]) > 0:
+                        return data["inventory_type"][0]
+                elif resp.status == 404:
+                    logger.warning(f"物品 '{item_name}' 未找到")
+                else:
+                    logger.error(f"搜索物品失败: {resp.status}")
+        except Exception as e:
+            logger.error(f"搜索物品异常: {e}")
+        return None
+
+    async def get_region_orders(self, region_id: int, type_id: int) -> Optional[Dict]:
+        """
+        获取指定区域、指定物品的市场订单
+        GET /markets/{region_id}/orders/?order_type=all&type_id={type_id}
+        返回数据包含 buy 和 sell 两个数组
+        """
+        cache_key = f"{region_id}_{type_id}"
+        if cache_key in self.cache:
+            data, timestamp = self.cache[cache_key]
+            if (datetime.now().timestamp() - timestamp) < self.cache_ttl:
+                logger.debug(f"使用缓存 {cache_key}")
+                return data
         
         try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            # 创建默认配置文件
-            with open(config_path, 'w', encoding='utf-8') as f:
-                json.dump(default_config, f, indent=4, ensure_ascii=False)
-            return default_config
-    
-    # ============================================
-    # 第五部分：命令处理函数
-    # ============================================
-    
-    @Command("eve", "eve查询")
-    async def query_market(self, event: AstrMessageEvent):
-        """
-        查询EVE市场价格
-        用法: /eve [物品名称] [星域名称]
-        示例: /eve 三钛合金 吉他
-        """
-        message_str = str(event.message).strip()
-        parts = message_str.split()
+            session = await self.get_session()
+            url = f"{ESI_BASE_URL}/markets/{region_id}/orders/"
+            params = {
+                "order_type": "all",
+                "type_id": type_id
+            }
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    orders = await resp.json()
+                    # 分离买单和卖单
+                    buy_orders = [o for o in orders if o["is_buy_order"]]
+                    sell_orders = [o for o in orders if not o["is_buy_order"]]
+                    
+                    # 最优买价（最高买入价，即玩家愿意出的最高价）
+                    best_buy = max(buy_orders, key=lambda x: x["price"]) if buy_orders else None
+                    # 最优卖价（最低卖出价）
+                    best_sell = min(sell_orders, key=lambda x: x["price"]) if sell_orders else None
+                    
+                    result = {
+                        "buy": best_buy,
+                        "sell": best_sell,
+                        "total_buy_volume": sum(o["volume_remain"] for o in buy_orders),
+                        "total_sell_volume": sum(o["volume_remain"] for o in sell_orders),
+                        "buy_count": len(buy_orders),
+                        "sell_count": len(sell_orders),
+                        "region_id": region_id,
+                        "type_id": type_id
+                    }
+                    self.cache[cache_key] = (result, datetime.now().timestamp())
+                    return result
+                else:
+                    logger.error(f"获取订单失败: {resp.status} - {await resp.text()}")
+        except Exception as e:
+            logger.error(f"获取订单异常: {e}")
+        return None
+
+    def format_price(self, price: float) -> str:
+        """格式化价格显示"""
+        return f"{price:,.2f} ISK"
+
+    def format_result(self, item_name: str, hub_name: str, data: Dict, type_id: int) -> str:
+        """格式化输出结果"""
+        best_sell = data.get("sell")
+        best_buy = data.get("buy")
         
-        # 参数检查
+        lines = [
+            f"📊 **{item_name}** 市场行情",
+            f"📍 {hub_name} (Region ID: {data['region_id']}, Type ID: {type_id})",
+            f"⏰ 更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "--- 卖单 (卖家挂单) ---"
+        ]
+        
+        if best_sell:
+            lines.append(f"💰 最低卖价: {self.format_price(best_sell['price'])}")
+            lines.append(f"📦 订单数量: {data['sell_count']} 个")
+            lines.append(f"📦 剩余总量: {self.format_price(data['total_sell_volume'])} 单位")
+            lines.append(f"🏢 所在星系: {best_sell.get('location_id', 'N/A')}")
+        else:
+            lines.append("❌ 暂无卖单")
+        
+        lines.append("")
+        lines.append("--- 买单 (玩家收单) ---")
+        
+        if best_buy:
+            lines.append(f"💰 最高买价: {self.format_price(best_buy['price'])}")
+            lines.append(f"📦 订单数量: {data['buy_count']} 个")
+            lines.append(f"📦 剩余总量: {self.format_price(data['total_buy_volume'])} 单位")
+            lines.append(f"🏢 所在星系: {best_buy.get('location_id', 'N/A')}")
+        else:
+            lines.append("❌ 暂无买单")
+        
+        # 如果有买卖双方，计算差价和利润率
+        if best_sell and best_buy:
+            spread = best_sell["price"] - best_buy["price"]
+            profit_margin = (spread / best_buy["price"]) * 100 if best_buy["price"] > 0 else 0
+            lines.append("")
+            lines.append("--- 套利分析 ---")
+            lines.append(f"📈 买卖差价: {self.format_price(spread)}")
+            lines.append(f"📊 利润率: {profit_margin:.2f}%")
+            lines.append("")
+            lines.append("*注：以上未计入税费和经纪费，实际利润会略低。*")
+        
+        return "\n".join(lines)
+
+    @filter.command("eveprice")
+    async def eveprice(self, event: AstrMessageEvent):
+        """
+        查询 EVE 欧服物品价格
+        用法: /eveprice <物品名称> [贸易中心]
+        示例: /eveprice 帕拉丁级
+              /eveprice 注射器 吉他
+        """
+        # 解析命令参数
+        message = event.message_str.strip()
+        parts = message.split(maxsplit=2)
+        
         if len(parts) < 2:
-            yield self._format_result("❌ 使用方法: /eve [物品名称] [星域名称]\n"
-                                    "示例: /eve 三钛合金 吉他\n"
-                                    "可用星域: " + ", ".join(self.REGIONS.keys()))
+            yield event.plain_result(
+                "❌ 用法错误！\n"
+                "正确用法:\n"
+                "/eveprice <物品名称> [贸易中心]\n"
+                "示例:\n"
+                "/eveprice 帕拉丁级\n"
+                "/eveprice 注射器 吉他\n\n"
+                "支持的贸易中心: " + ", ".join(TRADE_HUBS.keys())
+            )
+            return
+        
+        # 获取物品名称和贸易中心
+        item_name = parts[1]
+        hub_name = parts[2] if len(parts) > 2 else "吉他"
+        
+        # 检查贸易中心是否存在
+        if hub_name not in TRADE_HUBS:
+            yield event.plain_result(
+                f"❌ 未知贸易中心: {hub_name}\n"
+                f"支持的贸易中心: {', '.join(TRADE_HUBS.keys())}"
+            )
+            return
+        
+        region_id = TRADE_HUBS[hub_name]
+        
+        # 先发送一个"正在查询"的提示（可选，命令太长时有用）
+        yield event.plain_result(f"🔍 正在查询 {item_name} 在 {hub_name} 的市场行情...")
+        
+        # 获取物品 ID
+        type_id = None
+        
+        # 先检查常用物品映射
+        item_lower = item_name.lower()
+        if item_lower in COMMON_ITEMS:
+            type_id = COMMON_ITEMS[item_lower]
+            logger.info(f"从映射中找到物品: {item_name} -> {type_id}")
+        else:
+            # 调用 ESI 搜索
+            type_id = await self.search_type_id(item_name)
+            if not type_id:
+                # 尝试模糊匹配（去掉空格、中文简繁等简单处理）
+                yield event.plain_result(f"❌ 未找到物品: {item_name}\n请检查物品名称是否正确，或尝试使用英文名。")
+                return
+        
+        # 获取市场订单
+        market_data = await self.get_region_orders(region_id, type_id)
+        if not market_data:
+            yield event.plain_result(f"❌ 获取市场数据失败，请稍后重试。\n物品: {item_name} ({type_id})")
+            return
+        
+        # 格式化输出
+        result_text = self.format_result(item_name, hub_name, market_data, type_id)
+        yield event.plain_result(result_text)
+
+    @filter.command("evehubs")
+    async def evehubs(self, event: AstrMessageEvent):
+        """显示支持的贸易中心列表"""
+        hub_list = "\n".join([f"  • {name} (Region ID: {rid})" for name, rid in TRADE_HUBS.items()])
+        yield event.plain_result(
+            "🌟 **EVE Online 欧服贸易中心列表** 🌟\n\n"
+            f"{hub_list}\n\n"
+            "使用示例: `/eveprice 帕拉丁级 吉他`\n"
+            "不指定贸易中心时默认使用吉他 (Jita)。"
+        )
+
+    @filter.command("eveitemid")
+    async def eveitemid(self, event: AstrMessageEvent):
+        """
+        查询物品的 Type ID
+        用法: /eveitemid <物品名称>
+        """
+        message = event.message_str.strip()
+        parts = message.split(maxsplit=1)
+        
+        if len(parts) < 2:
+            yield event.plain_result("❌ 用法: /eveitemid <物品名称>")
             return
         
         item_name = parts[1]
-        region_name = parts[2] if len(parts) > 2 else "吉他"
         
-        # 验证星域
-        region_id = self.REGIONS.get(region_name)
-        if not region_id:
-            yield self._format_result(f"❌ 未知星域: {region_name}\n"
-                                    f"可用星域: {', '.join(self.REGIONS.keys())}")
-            return
+        yield event.plain_result(f"🔍 正在搜索物品: {item_name}...")
         
-        # 搜索物品
-        item_info = await self.market_api.search_item(item_name)
-        if not item_info:
-            yield self._format_result(f"❌ 未找到物品: {item_name}")
-            return
-        
-        type_id = item_info["type_id"]
-        item_name_found = item_info.get("name", item_name)
-        
-        # 获取买卖订单
-        sell_orders = await self.market_api.get_market_orders(region_id, type_id, "sell")
-        buy_orders = await self.market_api.get_market_orders(region_id, type_id, "buy")
-        
-        # 排序：卖单从低到高，买单从高到低
-        sell_orders.sort(key=lambda x: x.price)
-        buy_orders.sort(key=lambda x: x.price, reverse=True)
-        
-        # 构建返回结果
-        result = self._build_market_report(
-            item_name_found, region_name, sell_orders, buy_orders
-        )
-        
-        yield self._format_result(result)
-    
-    @Command("eve_price", "eve价格")
-    async def quick_price(self, event: AstrMessageEvent):
-        """
-        快速查询价格（默认吉他星系）
-        用法: /eve_price [物品名称]
-        """
-        message_str = str(event.message).strip()
-        parts = message_str.split()
-        
-        if len(parts) < 2:
-            yield self._format_result("❌ 使用方法: /eve_price [物品名称]\n"
-                                    "示例: /eve_price 三钛合金")
-            return
-        
-        item_name = " ".join(parts[1:])
-        region_id = self.REGIONS["吉他"]  # 默认吉他
-        
-        # 搜索物品
-        item_info = await self.market_api.search_item(item_name)
-        if not item_info:
-            yield self._format_result(f"❌ 未找到物品: {item_name}")
-            return
-        
-        type_id = item_info["type_id"]
-        item_name_found = item_info.get("name", item_name)
-        
-        # 获取订单
-        sell_orders = await self.market_api.get_market_orders(region_id, type_id, "sell")
-        buy_orders = await self.market_api.get_market_orders(region_id, type_id, "buy")
-        
-        # 构建快速价格报告
-        result = self._build_quick_price_report(item_name_found, sell_orders, buy_orders)
-        yield self._format_result(result)
-    
-    @Command("eve_search", "搜索物品")
-    async def search_items(self, event: AstrMessageEvent):
-        """
-        搜索EVE物品
-        用法: /eve_search [关键词]
-        """
-        message_str = str(event.message).strip()
-        parts = message_str.split()
-        
-        if len(parts) < 2:
-            yield self._format_result("❌ 使用方法: /eve_search [关键词]\n"
-                                    "示例: /eve_search 凤凰级")
-            return
-        
-        keyword = " ".join(parts[1:])
-        
-        # 直接搜索
-        session = await self.market_api._get_session()
-        url = f"{self.market_api.BASE_URL}/search/"
-        params = {
-            "categories": "inventory_type",
-            "search": keyword,
-            "strict": "false"
-        }
-        
-        try:
-            async with session.get(
-                url, 
-                params=params, 
-                proxy=self.market_api.proxy_url
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if "inventory_type" in data and data["inventory_type"]:
-                        type_ids = data["inventory_type"][:10]
-                        
-                        # 获取物品名称
-                        items_info = []
-                        for type_id in type_ids:
-                            info = await self.market_api._get_item_info(type_id)
-                            if info:
-                                items_info.append(info)
-                        
-                        if items_info:
-                            result = f"🔍 搜索 '{keyword}' 的结果:\n"
-                            result += "=" * 30 + "\n"
-                            for i, item in enumerate(items_info, 1):
-                                result += f"{i}. {item['name']} (ID: {item['type_id']})\n"
-                            
-                            yield self._format_result(result)
-                            return
-                    
-                    yield self._format_result(f"❌ 未找到与 '{keyword}' 相关的物品")
-        except Exception as e:
-            yield self._format_result(f"❌ 搜索出错: {str(e)}")
-    
-    @Command("eve_help", "eve帮助")
-    async def show_help(self, event: AstrMessageEvent):
-        """显示帮助信息"""
-        help_text = """
-🚀 EVE Online 市场查询插件
+        type_id = await self.search_type_id(item_name)
+        if type_id:
+            yield event.plain_result(f"✅ 物品: {item_name}\n📦 Type ID: {type_id}\n\n可使用 `/eveprice {item_name}` 查询价格。")
+        else:
+            yield event.plain_result(f"❌ 未找到物品: {item_name}\n请检查名称或尝试英文名。")
 
-📋 可用命令:
-• /eve [物品名] [星域] - 查询市场价格
-• /eve_price [物品名] - 快速查价(吉他)
-• /eve_search [关键词] - 搜索物品
-• /eve_help - 显示帮助
-
-🌍 可用星域:
-吉他、艾玛、加达里、米玛塔尔、盖伦特
-
-📝 示例:
-/eve 三钛合金 吉他
-/eve_price 同位素-5
-        """
-        yield self._format_result(help_text.strip())
-    
-    # ============================================
-    # 第六部分：辅助函数（构建返回结果）
-    # ============================================
-    
-    def _build_market_report(
-        self, 
-        item_name: str, 
-        region_name: str,
-        sell_orders: List[MarketOrder], 
-        buy_orders: List[MarketOrder]
-    ) -> str:
-        """构建详细市场报告"""
-        result = f"📊 {item_name} - {region_name}市场行情\n"
-        result += "=" * 30 + "\n"
-        
-        if not sell_orders and not buy_orders:
-            result += "暂无市场数据\n"
-            return result
-        
-        # 最低卖价
-        if sell_orders:
-            min_sell = sell_orders[0]
-            result += f"📈 最低卖价: {min_sell.price:,.2f} ISK\n"
-            result += f"   数量: {min_sell.remaining:,}\n"
-            result += f"   地点: {min_sell.location}\n\n"
-        
-        # 最高买价
-        if buy_orders:
-            max_buy = buy_orders[0]
-            result += f"📉 最高买价: {max_buy.price:,.2f} ISK\n"
-            result += f"   数量: {max_buy.remaining:,}\n"
-            result += f"   地点: {max_buy.location}\n\n"
-        
-        # 价差分析
-        if sell_orders and buy_orders:
-            spread = max_buy.price - min_sell.price
-            spread_percent = (spread / min_sell.price) * 100 if min_sell.price > 0 else 0
-            result += f"💰 买卖价差: {spread:,.2f} ISK ({spread_percent:+.1f}%)\n"
-        
-        # 前5个卖单
-        if len(sell_orders) > 1:
-            result += "\n📋 最低5个卖单:\n"
-            for i, order in enumerate(sell_orders[:5], 1):
-                result += f"  {i}. {order.price:,.2f} ISK x{order.remaining:,}\n"
-        
-        # 前5个买单
-        if len(buy_orders) > 1:
-            result += "\n📋 最高5个买单:\n"
-            for i, order in enumerate(buy_orders[:5], 1):
-                result += f"  {i}. {order.price:,.2f} ISK x{order.remaining:,}\n"
-        
-        result += f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        return result
-    
-    def _build_quick_price_report(
-        self,
-        item_name: str,
-        sell_orders: List[MarketOrder],
-        buy_orders: List[MarketOrder]
-    ) -> str:
-        """构建快速价格报告"""
-        if not sell_orders and not buy_orders:
-            return f"❌ {item_name} 在吉他星系暂无市场订单"
-        
-        sell_orders.sort(key=lambda x: x.price)
-        buy_orders.sort(key=lambda x: x.price, reverse=True)
-        
-        result = f"💹 {item_name} - 吉他市场\n"
-        
-        if sell_orders:
-            result += f"最低卖价: {sell_orders[0].price:,.2f} ISK\n"
-        
-        if buy_orders:
-            result += f"最高买价: {buy_orders[0].price:,.2f} ISK\n"
-        
-        if sell_orders and buy_orders:
-            avg_price = (sell_orders[0].price + buy_orders[0].price) / 2
-            result += f"参考价格: {avg_price:,.2f} ISK\n"
-        
-        return result
-    
-    def _format_result(self, text: str) -> MessageEventResult:
-        """格式化返回结果"""
-        return MessageEventResult(MessageChain([Plain(text)]))
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """插件退出时清理资源"""
-        await self.market_api.close()
+    async def terminate(self):
+        """插件卸载时调用，关闭网络连接"""
+        await self.close_session()
+        logger.info("EVE Market 插件已卸载")
 
 
-# ============================================
-# 第七部分：插件入口
-# ============================================
-def create_plugin(context: Context) -> Plugin:
-    """
-    插件创建函数（AstrBot调用此函数创建插件实例）
-    Args:
-        context: AstrBot上下文
-    Returns:
-        插件实例
-    """
-    return EVEMarketPlugin(context)
+# 插件注册（元数据）
+def register_plugin(context: Context):
+    """AstrBot 插件入口"""
+    return EveMarketPlugin(context)
