@@ -1,95 +1,152 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+import aiohttp
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-import requests
 
-class market_item:
-    def __init__(self, name, sug_price, avg_price):
-        self.name = name
-        self.sug_price = sug_price
-        self.avg_price = avg_price
-
-@register("eveMarket_plugin", "Chillizu", "EVE 市场查询插件", "1.0.0")
-class MyPlugin(Star):
+@register("astrbot_plugin_eve_market", "你的名字", "EVE Online市场查询插件", "1.0.0", "仓库地址")
+class EveMarketPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.market_data = {}  # 存储市场数据：name -> market_item
-
-    async def initialize(self):
-        """初始化时加载市场数据"""
-        await self.refresh_data()
-
-    async def refresh_data(self):
-        """刷新市场数据"""
+        self.base_url = "https://esi.evetech.net/latest"
+    
+    @filter.command("market")
+    async def query_market(self, event: AstrMessageEvent):
+        """查询EVE市场价格，用法：/market <物品名称> [region_id]"""
+        # 修复1：使用正确的方法获取消息文本
+        # 对于 AiocqhttpMessageEvent，应该使用 event.message_str 或 str(event.message)
         try:
-            # 获取所有物品的价格数据
-            prices_response = requests.get("https://esi.evetech.net/latest/markets/prices/", headers={
-                "Accept-Language": "zh",
-                "Accept": "application/json"
-            })
-            prices_data = prices_response.json()  # list of {"type_id": int, "average_price": float, "adjusted_price": float}
-
-            # 提取type_ids
-            type_ids = [item['type_id'] for item in prices_data]
-
-            # 获取名称
-            names_response = requests.post("https://esi.evetech.net/latest/universe/names/", json=type_ids, headers={
-                "Accept-Language": "zh",
-                "Accept": "application/json"
-            })
-            names_data = names_response.json()  # list of {"id": int, "name": str}
-
-            # 创建name到id的映射
-            id_to_name = {entry['id']: entry['name'] for entry in names_data}
-
-            # 创建market_data
-            self.market_data = {}
-            for item in prices_data:
-                tid = item['type_id']
-                name = id_to_name.get(tid, f"Unknown Item {tid}")
-                self.market_data[name.lower()] = market_item(
-                    name=name,
-                    sug_price=item.get('adjusted_price', 0),
-                    avg_price=item.get('average_price', 0)
-                )
-
-            logger.info(f"市场数据刷新完成，共加载 {len(self.market_data)} 个物品")
-        except Exception as e:
-            logger.error(f"刷新市场数据失败: {e}")
-
-    @filter.command_group("eveMarket")
-    def eveMarket(self):
-        print("EVE Market Check\n  usage:\n    eveMarket refresh - 刷新市场数据\n    eveMarket check {item_name} - 查询物品价格")
-
-    @eveMarket.command("refresh")
-    async def refresh(self, event: AstrMessageEvent):
-        """刷新市场信息至缓存"""
-        await self.refresh_data()
-        yield event.plain_result("市场数据已刷新")
-
-    @eveMarket.command("check")
-    async def check(self, event: AstrMessageEvent):
-        """查询物品价格"""
-        # 获取用户输入的物品名称
-        args = event.message_str.strip().split()
-        if len(args) < 2:
-            yield event.plain_result("请提供物品名称，例如：eveMarket check Tritanium")
-            return
-
-        item_name = " ".join(args[1:]).lower()
-        if item_name in self.market_data:
-            item = self.market_data[item_name]
-            result = f"物品: {item.name}\n建议价格: {item.sug_price:.2f} ISK\n平均价格: {item.avg_price:.2f} ISK"
-            yield event.plain_result(result)
-        else:
-            # 尝试模糊匹配
-            matches = [name for name in self.market_data if item_name in name]
-            if matches:
-                result = f"未找到 exact 匹配，相似物品:\n" + "\n".join(matches[:5])
-                yield event.plain_result(result)
+            # 尝试多种获取消息文本的方式
+            if hasattr(event, 'get_plain_text'):
+                message_text = event.get_plain_text()
+            elif hasattr(event, 'message_str'):
+                message_text = event.message_str
             else:
-                yield event.plain_result("未找到该物品，请检查名称")
-
-    async def terminate(self):
-        """插件销毁"""
-        pass
+                message_text = str(event.message)
+        except Exception as e:
+            logger.error(f"获取消息文本失败: {e}")
+            yield event.plain_result("获取消息内容失败")
+            return
+        
+        # 解析命令和参数
+        parts = message_text.strip().split()
+        if len(parts) < 2:
+            yield event.plain_result("请提供物品名称！\n用法：/market 核心扫描器 10000002\n区域ID可选，默认为吉他(10000002)")
+            return
+        
+        # 获取参数：/market 后面的部分
+        args = parts[1:]
+        item_name = args[0]
+        
+        # 处理区域ID（可选参数）
+        region_id = 10000002  # 默认吉他
+        if len(args) > 1:
+            try:
+                region_id = int(args[1])
+            except ValueError:
+                yield event.plain_result(f"区域ID必须是数字，你输入的是：{args[1]}")
+                return
+        
+        # 发送提示消息
+        yield event.plain_result(f"正在查询 {item_name} 在区域 {region_id} 的市场订单...")
+        
+        try:
+            # 第一步：获取物品Type ID
+            type_id = await self._get_type_id(item_name)
+            if not type_id:
+                yield event.plain_result(f"未找到物品 '{item_name}'，请检查物品名称是否正确（建议使用EVE官方中文名）")
+                return
+            
+            # 第二步：查询市场订单
+            orders = await self._get_market_orders(region_id, type_id)
+            
+            # 第三步：处理并返回结果
+            if not orders:
+                yield event.plain_result(f"未找到 {item_name} 的市场订单")
+                return
+            
+            # 分离买家和卖家订单
+            buy_orders = [o for o in orders if o.get('is_buy_order', False)]
+            sell_orders = [o for o in orders if not o.get('is_buy_order', False)]
+            
+            # 格式化输出
+            result = f"【{item_name}】市场行情 (区域ID: {region_id})\n"
+            
+            if sell_orders:
+                # 获取最低的5个卖单
+                top_sell = sorted(sell_orders, key=lambda x: x['price'])[:5]
+                result += "\n📈 最低卖价:\n"
+                for i, order in enumerate(top_sell, 1):
+                    result += f"  {i}. {order['price']:,.2f} ISK (数量: {order['volume_remain']:,})\n"
+                
+                lowest_sell = top_sell[0]
+                result += f"\n⭐ 最优卖价: {lowest_sell['price']:,.2f} ISK\n"
+            
+            if buy_orders:
+                # 获取最高的5个买单
+                top_buy = sorted(buy_orders, key=lambda x: x['price'], reverse=True)[:5]
+                result += "\n📉 最高买价:\n"
+                for i, order in enumerate(top_buy, 1):
+                    result += f"  {i}. {order['price']:,.2f} ISK (数量: {order['volume_remain']:,})\n"
+                
+                highest_buy = top_buy[0]
+                result += f"\n⭐ 最优买价: {highest_buy['price']:,.2f} ISK\n"
+            
+            result += f"\n📊 总订单数: {len(orders)} (卖单:{len(sell_orders)}/买单:{len(buy_orders)})"
+            
+            # 添加价格差额信息
+            if sell_orders and buy_orders:
+                spread = lowest_sell['price'] - highest_buy['price']
+                result += f"\n💰 买卖差价: {spread:,.2f} ISK"
+            
+            yield event.plain_result(result)
+            
+        except aiohttp.ClientError as e:
+            logger.error(f"网络请求失败: {e}")
+            yield event.plain_result(f"网络请求失败，请稍后重试\n错误: {str(e)}")
+        except Exception as e:
+            logger.error(f"查询失败: {e}")
+            yield event.plain_result(f"查询失败: {str(e)}\n请检查物品名称是否正确")
+    
+    async def _get_type_id(self, item_name: str) -> int:
+        """搜索物品ID"""
+        async with aiohttp.ClientSession() as session:
+            # 尝试中文搜索
+            url = f"{self.base_url}/universe/search/"
+            params = {
+                "categories": "inventory_type",
+                "search": item_name,
+                "language": "zh"
+            }
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        types = data.get('inventory_type', [])
+                        if types:
+                            return types[0]
+                    elif resp.status == 404:
+                        return None
+                    else:
+                        logger.error(f"ESI搜索失败: HTTP {resp.status}")
+                        return None
+            except Exception as e:
+                logger.error(f"搜索物品ID异常: {e}")
+                return None
+    
+    async def _get_market_orders(self, region_id: int, type_id: int) -> list:
+        """获取市场订单"""
+        async with aiohttp.ClientSession() as session:
+            url = f"{self.base_url}/markets/{region_id}/orders/"
+            params = {"type_id": type_id, "order_type": "all"}
+            try:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 404:
+                        return []
+                    else:
+                        logger.error(f"ESI市场订单失败: HTTP {resp.status}")
+                        return []
+            except Exception as e:
+                logger.error(f"获取市场订单异常: {e}")
+                return []
