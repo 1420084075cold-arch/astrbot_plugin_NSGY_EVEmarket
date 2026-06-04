@@ -8,31 +8,31 @@ from typing import Optional, Tuple, List
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+    
+    # 定义区域ID常量
+    REGION_ID_FORGE = 10000002      # The Forge 区域（Jita所在）
+    REGION_ID_PLEX_GLOBAL = 19000001  # PLEX 全球统一市场区域
+    SYSTEM_ID_JITA = 30000142       # Jita 星系
+    ESI_BASE = "https://esi.evetech.net/latest"
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
     @filter.command("helloworld")
     async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
+        """这是一个 hello world 指令"""
         user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages()# 用户所发的消息的消息链 # from astrbot.api.message_components import *
-     #   message_group = event.group_id
+        message_str = event.message_str
+        message_chain = event.get_messages()
         logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!")
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
 
-    # 将方法改为类方法或实例方法，并添加 @staticmethod 装饰器
     @staticmethod
     def get_type_id_by_name_fuzzwork(name: str) -> Optional[int]:
-        """
-        优先用 fuzzwork 按英文名查询 type_id。
-        """
-        ESI_BASE = "https://esi.evetech.net/latest"
+        """优先用 fuzzwork 按英文名查询 type_id。"""
         url = "https://www.fuzzwork.co.uk/api/typeid.php"
         params = {"typename": name}
         r = requests.get(url, params=params, timeout=10)
@@ -47,69 +47,56 @@ class MyPlugin(Star):
 
     @staticmethod
     def get_type_id_by_name_esi(name: str) -> Optional[int]:
-        """
-        用 ESI 的 /universe/ids/ 接口，根据名称（可中文）查 type_id。
-        ESI 会按你客户端使用的语言返回对应的名字，支持多语言。
-        """
+        """用 ESI 的 /universe/ids/ 接口，根据名称（可中文）查 type_id。"""
         ESI_BASE = "https://esi.evetech.net/latest"
         url = f"{ESI_BASE}/universe/ids/"
-        headers = {
-            # 可指定语言（目前支持 zh），但这里查 type_id 不影响结果
-            "Accept-Language": "zh",
-        }
-        # /universe/ids/ 需要 POST 一个字符串数组
+        headers = {"Accept-Language": "zh"}
         resp = requests.post(url, headers=headers, json=[name], timeout=10)
         if resp.status_code != 200:
             return None
 
         data = resp.json()
-        # 结构类似:
-        # {
-        #   "inventory_types": [
-        #       {"id": 34, "name": "Tritanium"}
-        #   ]
-        # }
         inv_types: List[dict] = data.get("inventory_types") or []
         if not inv_types:
             return None
-
-        # 这里默认取第一个匹配的
         return inv_types[0].get("id")
 
     @staticmethod
     def get_type_id_by_name(name: str) -> Optional[int]:
-        """
-        综合函数：先尝试英文名（fuzzwork），失败再用 ESI 多语言搜索。
-        支持英文或中文名称。
-        """
-        # 1. 尝试 fuzzwork（英文名）
+        """综合函数：先尝试英文名（fuzzwork），失败再用 ESI 多语言搜索。"""
         type_id = MyPlugin.get_type_id_by_name_fuzzwork(name)
         if type_id:
             return type_id
-
-        # 2. 失败则尝试 ESI 的多语言名称搜索（支持中文）
         type_id = MyPlugin.get_type_id_by_name_esi(name)
         return type_id
 
-    @staticmethod
-    def get_jita_price_by_type_id(type_id: int) -> Tuple[Optional[float], Optional[float]]:
+    def get_jita_price_by_type_id(self, type_id: int, region_id: int = None) -> Tuple[Optional[float], Optional[float]]:
         """
-        根据 type_id 获取 Jita 的最低卖价和最高买价。
+        根据 type_id 获取指定区域的最低卖价和最高买价。
+        
+        参数:
+            type_id: 物品类型ID
+            region_id: 区域ID，如果不指定则使用 The Forge (Jita所在区域)
+                      对于 PLEX 应使用 19000001 (全球市场)
         """
-        ESI_BASE = "https://esi.evetech.net/latest"
-        REGION_ID_FORGE = 10000002  # The Forge 区域
-        SYSTEM_ID_JITA = 30000142  # Jita 星系
+        # 如果没有指定 region_id，默认使用 The Forge
+        if region_id is None:
+            region_id = self.REGION_ID_FORGE
+        
+        # 注意：PLEX 全球市场不需要检查 system_id，因为它是全球统一的
+        # 只有 The Forge 区域需要过滤 Jita 星系的订单
+        check_system = (region_id == self.REGION_ID_FORGE)
         
         page = 1
         sell_prices = []
         buy_prices = []
 
         while True:
-            url = f"{ESI_BASE}/markets/{REGION_ID_FORGE}/orders/"
+            url = f"{self.ESI_BASE}/markets/{region_id}/orders/"
             params = {
                 "order_type": "all",
                 "page": page,
-                "type_id": type_id,   # 只查这个物品
+                "type_id": type_id,
             }
             resp = requests.get(url, params=params, timeout=10)
             resp.raise_for_status()
@@ -119,7 +106,8 @@ class MyPlugin(Star):
                 break
 
             for order in orders:
-                if order.get("system_id") != SYSTEM_ID_JITA:
+                # 只有 The Forge 区域需要过滤 Jita 星系
+                if check_system and order.get("system_id") != self.SYSTEM_ID_JITA:
                     continue
 
                 price = order["price"]
@@ -137,36 +125,80 @@ class MyPlugin(Star):
         max_buy = max(buy_prices) if buy_prices else None
         return min_sell, max_buy
 
-    @staticmethod
-    def get_jita_price_by_name(name: str) -> Tuple[Optional[int], Optional[float], Optional[float]]:
+    def get_jita_price_by_name(self, name: str, region_id: int = None) -> Tuple[Optional[int], Optional[float], Optional[float]]:
         """
-        核心函数：直接用名字查 Jita 价格。
+        核心函数：直接用名字查价格。
         支持英文和中文名。
-        返回 (type_id, min_sell, max_buy)
+        
+        参数:
+            name: 物品名称
+            region_id: 区域ID，如果不指定则根据物品自动选择
+                      对于 PLEX 会自动使用全球市场 ID
+        返回:
+            (type_id, min_sell, max_buy)
         """
-        type_id = MyPlugin.get_type_id_by_name(name)
+        # 自动判断：如果是 PLEX，使用全球市场区域
+        if region_id is None and name.lower() == "plex":
+            region_id = self.REGION_ID_PLEX_GLOBAL
+            logger.info(f"检测到 PLEX 查询，使用全球市场区域 ID: {region_id}")
+        
+        type_id = self.get_type_id_by_name(name)
         if not type_id:
             return None, None, None
 
-        min_sell, max_buy = MyPlugin.get_jita_price_by_type_id(type_id)
+        min_sell, max_buy = self.get_jita_price_by_type_id(type_id, region_id)
         return type_id, min_sell, max_buy
 
     @filter.command(".jita")
     async def jita(self, event: AstrMessageEvent, content_message: str):
-        item_name = content_message.strip()  # 添加 strip() 去除首尾空格
-        type_id, min_sell, max_buy = self.get_jita_price_by_name(item_name)  # 改为 self.
+        """查询 Jita 或全球市场的物品价格"""
+        item_name = content_message.strip()
+        
+        if not item_name:
+            yield event.plain_result("请提供物品名称，例如：.jita Tritanium 或 .jita PLEX")
+            return
+        
+        # 查询价格
+        type_id, min_sell, max_buy = self.get_jita_price_by_name(item_name)
         
         if not type_id:
-            yield event.plain_result(f"未找到该物品，请确认名称是否正确。")
-        else:
-            # 修复：正确缩进这里的代码
-            # 注意：不能在 yield 后面直接使用 print，应该使用 logger
-            logger.info(f"物品: {item_name} (type_id={type_id})")
-            
-            if min_sell is None and max_buy is None:
-                yield event.plain_result(f"在 Jita 当前没有订单。")
+            yield event.plain_result(f"未找到物品「{item_name}」，请确认名称是否正确。")
+            return
+        
+        # 判断是 PLEX 还是普通物品，用于显示不同的提示信息
+        is_plex = item_name.lower() == "plex"
+        
+        # 记录日志
+        logger.info(f"查询物品: {item_name} (type_id={type_id}, is_plex={is_plex})")
+        
+        # 构建回复消息
+        if min_sell is None and max_buy is None:
+            if is_plex:
+                yield event.plain_result(f"PLEX 在全球市场当前没有订单，请稍后再试。")
             else:
-                # 修复：将两个结果合并为一条消息，或者分别 yield
-                sell_text = f"Jita 最低卖价: {min_sell if min_sell is not None else '无'}"
-                buy_text = f"Jita 最高买价: {max_buy if max_buy is not None else '无'}"
-                yield event.plain_result(f"{sell_text}\n{buy_text}")
+                yield event.plain_result(f"「{item_name}」在 Jita 当前没有订单。")
+        else:
+            # 构建价格信息
+            result_parts = [f"物品: {item_name}"]
+            if is_plex:
+                result_parts.append("市场: PLEX 全球统一市场")
+            else:
+                result_parts.append("市场: Jita (The Forge)")
+            
+            if min_sell is not None:
+                result_parts.append(f"💰 最低卖价: {min_sell:,.2f} ISK")
+            else:
+                result_parts.append(f"💰 最低卖价: 无")
+                
+            if max_buy is not None:
+                result_parts.append(f"💎 最高买价: {max_buy:,.2f} ISK")
+            else:
+                result_parts.append(f"💎 最高买价: 无")
+            
+            # 计算差价（如果有买卖双方价格）
+            if min_sell is not None and max_buy is not None and min_sell > max_buy:
+                spread = min_sell - max_buy
+                spread_percent = (spread / max_buy) * 100
+                result_parts.append(f"📊 差价: {spread:,.2f} ISK ({spread_percent:.1f}%)")
+            
+            yield event.plain_result("\n".join(result_parts))
