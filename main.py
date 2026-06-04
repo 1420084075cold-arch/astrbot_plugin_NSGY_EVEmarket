@@ -2,9 +2,10 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 import requests
+import re
 from typing import Optional, Tuple, List
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
+@register("EveMarket", "YourName", "EVE Online 市场查询插件，支持Jita价格、PLEX、模糊搜索和数量计算", "1.0.0")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -14,9 +15,14 @@ class MyPlugin(Star):
     REGION_ID_PLEX_GLOBAL = 19000001  # PLEX 全球统一市场区域
     SYSTEM_ID_JITA = 30000142       # Jita 星系
     ESI_BASE = "https://esi.evetech.net/latest"
+    
+    # PLEX 相关常量
+    PLEX_TYPE_ID = 44992  # PLEX 的物品 ID
+    PLEX_DEFAULT_QUANTITY = 500  # 默认查询 500 PLEX
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        logger.info("EVE Market 插件已加载")
 
     @filter.command("helloworld")
     async def helloworld(self, event: AstrMessageEvent):
@@ -61,16 +67,111 @@ class MyPlugin(Star):
             return None
         return inv_types[0].get("id")
 
-    @staticmethod
-    def get_type_id_by_name(name: str) -> Optional[int]:
-        """综合函数：先尝试英文名（fuzzwork），失败再用 ESI 多语言搜索。"""
-        type_id = MyPlugin.get_type_id_by_name_fuzzwork(name)
-        if type_id:
-            return type_id
-        type_id = MyPlugin.get_type_id_by_name_esi(name)
-        return type_id
+    def search_inventory_types(self, search_string: str, strict: bool = False) -> Optional[List[int]]:
+        """
+        使用 ESI /search/ 接口模糊搜索物品
+        
+        参数:
+            search_string: 搜索关键词（支持中文）
+            strict: True=精确匹配，False=模糊匹配
+        
+        返回:
+            匹配的 type_id 列表，未找到返回 None
+        """
+        url = f"{self.ESI_BASE}/v2/search/"
+        params = {
+            "categories": "inventory_type",
+            "search": search_string,
+        }
+        if strict:
+            params["strict"] = "true"
+        
+        headers = {"Accept-Language": "zh"}
+        
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            if resp.status_code != 200:
+                logger.error(f"搜索失败: {resp.status_code}")
+                return None
+            
+            data = resp.json()
+            results = data.get("inventory_type", [])
+            
+            if results:
+                logger.info(f"搜索 '{search_string}' 找到 {len(results)} 个结果")
+                return results
+            return None
+        except Exception as e:
+            logger.error(f"搜索出错: {e}")
+            return None
 
-    def get_jita_price_by_type_id(self, type_id: int, region_id: int = None) -> Tuple[Optional[float], Optional[float]]:
+    def get_type_id_by_name(self, name: str, use_fuzzy: bool = True) -> Tuple[Optional[int], Optional[List[int]]]:
+        """
+        综合查询物品ID，支持精确查询和模糊搜索
+        
+        参数:
+            name: 物品名称
+            use_fuzzy: 是否在精确查询失败时使用模糊搜索
+        
+        返回:
+            (type_id, fuzzy_results) - type_id 是最终的 ID，fuzzy_results 是模糊搜索的所有结果
+        """
+        # 1. 尝试精确查询（fuzzwork）
+        type_id = self.get_type_id_by_name_fuzzwork(name)
+        if type_id:
+            return type_id, None
+        
+        # 2. 尝试精确查询（ESI）
+        type_id = self.get_type_id_by_name_esi(name)
+        if type_id:
+            return type_id, None
+        
+        # 3. 如果允许模糊搜索，尝试模糊搜索
+        if use_fuzzy:
+            fuzzy_results = self.search_inventory_types(name)
+            if fuzzy_results and len(fuzzy_results) > 0:
+                return fuzzy_results[0], fuzzy_results
+        
+        return None, None
+
+    def parse_query_input(self, input_str: str) -> Tuple[str, int]:
+        """
+        解析用户输入，提取物品名称和数量
+        
+        支持格式:
+            - ".jita Tritanium"          # 默认数量1
+            - ".jita Tritanium x100"     # 100个
+            - ".jita Tritanium * 100"    # 100个
+            - ".jita 100x Tritanium"     # 100个
+            - ".jita 100 Tritanium"      # 100个（需要判断数字在前还是物品名在前）
+        
+        返回:
+            (item_name, quantity)
+        """
+        input_str = input_str.strip()
+        
+        # 模式1: 物品名 x数量 或 物品名*数量
+        pattern1 = r'^(.+?)\s*[×x*]\s*(\d+)$'
+        match = re.match(pattern1, input_str, re.IGNORECASE)
+        if match:
+            return match.group(1).strip(), int(match.group(2))
+        
+        # 模式2: 数量x物品名 或 数量*物品名
+        pattern2 = r'^(\d+)\s*[×x*]\s*(.+?)$'
+        match = re.match(pattern2, input_str, re.IGNORECASE)
+        if match:
+            return match.group(2).strip(), int(match.group(1))
+        
+        # 模式3: 数字在前，空格分隔（如 "100 Tritanium"）
+        pattern3 = r'^(\d+)\s+(.+?)$'
+        match = re.match(pattern3, input_str)
+        if match:
+            return match.group(2).strip(), int(match.group(1))
+        
+        # 默认：没有数量，返回数量1
+        return input_str, 1
+
+    def get_price_by_type_id(self, type_id: int, region_id: int = None) -> Tuple[Optional[float], Optional[float]]:
         """
         根据 type_id 获取指定区域的最低卖价和最高买价。
         
@@ -98,9 +199,13 @@ class MyPlugin(Star):
                 "page": page,
                 "type_id": type_id,
             }
-            resp = requests.get(url, params=params, timeout=10)
-            resp.raise_for_status()
-            orders = resp.json()
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+                resp.raise_for_status()
+                orders = resp.json()
+            except Exception as e:
+                logger.error(f"获取订单失败: {e}")
+                return None, None
 
             if not orders:
                 break
@@ -125,80 +230,222 @@ class MyPlugin(Star):
         max_buy = max(buy_prices) if buy_prices else None
         return min_sell, max_buy
 
-    def get_jita_price_by_name(self, name: str, region_id: int = None) -> Tuple[Optional[int], Optional[float], Optional[float]]:
+    def get_price_by_name(self, name: str, quantity: int = 1, region_id: int = None) -> Tuple[Optional[int], Optional[float], Optional[float], Optional[List[int]]]:
         """
-        核心函数：直接用名字查价格。
-        支持英文和中文名。
+        核心函数：根据名称查询价格，支持数量计算。
         
         参数:
             name: 物品名称
+            quantity: 数量
             region_id: 区域ID，如果不指定则根据物品自动选择
-                      对于 PLEX 会自动使用全球市场 ID
+        
         返回:
-            (type_id, min_sell, max_buy)
+            (type_id, total_sell_price, total_buy_price, fuzzy_results)
+            total_sell_price = 单价 * 数量
+            total_buy_price = 单价 * 数量
         """
         # 自动判断：如果是 PLEX，使用全球市场区域
         if region_id is None and name.lower() == "plex":
             region_id = self.REGION_ID_PLEX_GLOBAL
-            logger.info(f"检测到 PLEX 查询，使用全球市场区域 ID: {region_id}")
+            # PLEX 自动使用 500 数量
+            if quantity == 1:
+                quantity = self.PLEX_DEFAULT_QUANTITY
+                logger.info(f"PLEX 查询，自动使用 {quantity} 个")
         
-        type_id = self.get_type_id_by_name(name)
+        # 获取物品 ID（支持模糊搜索）
+        type_id, fuzzy_results = self.get_type_id_by_name(name)
         if not type_id:
-            return None, None, None
-
-        min_sell, max_buy = self.get_jita_price_by_type_id(type_id, region_id)
-        return type_id, min_sell, max_buy
+            return None, None, None, fuzzy_results
+        
+        # 获取单价
+        unit_sell, unit_buy = self.get_price_by_type_id(type_id, region_id)
+        
+        # 计算总价
+        total_sell = unit_sell * quantity if unit_sell else None
+        total_buy = unit_buy * quantity if unit_buy else None
+        
+        return type_id, total_sell, total_buy, fuzzy_results
 
     @filter.command(".jita")
-    async def jita(self, event: AstrMessageEvent, content_message: str):
-        """查询 Jita 或全球市场的物品价格"""
-        item_name = content_message.strip()
+    async def jita(self, event: AstrMessageEvent, content_message: str = ""):
+        """查询 Jita 或全球市场的物品价格，支持数量计算和模糊搜索
+        
+        用法:
+            .jita 物品名              # 查询1个的价格
+            .jita 物品名 x100         # 查询100个的价格
+            .jita 物品名 * 100        # 查询100个的价格
+            .jita 100x 物品名         # 查询100个的价格
+            .jita PLEX                # 自动查询500 PLEX
+            .jita PLEX x1000          # 查询1000 PLEX
+        """
+        if not content_message:
+            yield event.plain_result("请提供物品名称，例如：.jita Tritanium 或 .jita PLEX\n支持数量格式：.jita Tritanium x100")
+            return
+        
+        # 解析物品名称和数量
+        item_name, quantity = self.parse_query_input(content_message)
         
         if not item_name:
-            yield event.plain_result("请提供物品名称，例如：.jita Tritanium 或 .jita PLEX")
+            yield event.plain_result("请提供物品名称")
             return
         
         # 查询价格
-        type_id, min_sell, max_buy = self.get_jita_price_by_name(item_name)
+        type_id, total_sell, total_buy, fuzzy_results = self.get_price_by_name(item_name, quantity)
         
+        # 处理未找到物品的情况
         if not type_id:
-            yield event.plain_result(f"未找到物品「{item_name}」，请确认名称是否正确。")
+            if fuzzy_results and len(fuzzy_results) > 1:
+                # 找到多个结果，显示前5个让用户选择
+                result_msg = f"未找到「{item_name}」，找到以下相关物品：\n"
+                for i, tid in enumerate(fuzzy_results[:5]):
+                    result_msg += f"{i+1}. Type ID: {tid}\n"
+                result_msg += "\n请使用更精确的名称或直接使用 Type ID 查询：.jitaid [TypeID]"
+                yield event.plain_result(result_msg)
+            else:
+                yield event.plain_result(f"未找到物品「{item_name}」，请确认名称是否正确。\n提示：支持中英文名称，也可以尝试使用部分名称模糊搜索。")
             return
         
-        # 判断是 PLEX 还是普通物品，用于显示不同的提示信息
-        is_plex = item_name.lower() == "plex"
+        # 判断是否为 PLEX
+        is_plex = item_name.lower() == "plex" or type_id == self.PLEX_TYPE_ID
+        
+        # 获取单价用于显示
+        unit_sell = total_sell / quantity if total_sell else None
+        unit_buy = total_buy / quantity if unit_buy else None
         
         # 记录日志
-        logger.info(f"查询物品: {item_name} (type_id={type_id}, is_plex={is_plex})")
+        logger.info(f"查询物品: {item_name} (type_id={type_id}, 数量={quantity}, is_plex={is_plex})")
         
         # 构建回复消息
-        if min_sell is None and max_buy is None:
+        if total_sell is None and total_buy is None:
             if is_plex:
                 yield event.plain_result(f"PLEX 在全球市场当前没有订单，请稍后再试。")
             else:
                 yield event.plain_result(f"「{item_name}」在 Jita 当前没有订单。")
         else:
-            # 构建价格信息
-            result_parts = [f"物品: {item_name}"]
+            result_parts = []
+            
+            # 物品名称和数量
+            if quantity > 1:
+                result_parts.append(f"物品: {item_name} × {quantity}")
+            else:
+                result_parts.append(f"物品: {item_name}")
+            
+            # 市场类型
             if is_plex:
                 result_parts.append("市场: PLEX 全球统一市场")
             else:
                 result_parts.append("市场: Jita (The Forge)")
             
-            if min_sell is not None:
-                result_parts.append(f"💰 最低卖价: {min_sell:,.2f} ISK")
+            # 卖价
+            if total_sell is not None:
+                result_parts.append(f"💰 最低卖价: {total_sell:,.2f} ISK")
+                if quantity > 1 and unit_sell:
+                    result_parts.append(f"   (单价: {unit_sell:,.2f} ISK)")
             else:
                 result_parts.append(f"💰 最低卖价: 无")
-                
-            if max_buy is not None:
-                result_parts.append(f"💎 最高买价: {max_buy:,.2f} ISK")
+            
+            # 买价
+            if total_buy is not None:
+                result_parts.append(f"💎 最高买价: {total_buy:,.2f} ISK")
+                if quantity > 1 and unit_buy:
+                    result_parts.append(f"   (单价: {unit_buy:,.2f} ISK)")
             else:
                 result_parts.append(f"💎 最高买价: 无")
             
             # 计算差价（如果有买卖双方价格）
-            if min_sell is not None and max_buy is not None and min_sell > max_buy:
-                spread = min_sell - max_buy
-                spread_percent = (spread / max_buy) * 100
+            if total_sell is not None and total_buy is not None and total_sell > total_buy:
+                spread = total_sell - total_buy
+                spread_percent = (spread / total_buy) * 100
                 result_parts.append(f"📊 差价: {spread:,.2f} ISK ({spread_percent:.1f}%)")
             
+            # 如果是模糊搜索匹配的，添加提示
+            if fuzzy_results and len(fuzzy_results) > 0:
+                result_parts.append(f"\n💡 提示: 这是模糊搜索匹配到的结果，如需精确查询请使用完整名称。")
+            
             yield event.plain_result("\n".join(result_parts))
+    
+    @filter.command(".jitaid")
+    async def jita_by_id(self, event: AstrMessageEvent, type_id_str: str):
+        """通过 type_id 查询价格，支持数量
+        
+        用法:
+            .jitaid 34              # 查询 type_id 34 的价格
+            .jitaid 34 x100         # 查询 100 个
+        """
+        # 解析输入
+        content = type_id_str.strip()
+        
+        # 检查是否有数量
+        quantity = 1
+        type_id_str = content
+        
+        pattern = r'^(\d+)\s*[×x*]\s*(\d+)$'
+        match = re.match(pattern, content, re.IGNORECASE)
+        if match:
+            type_id_str = match.group(1)
+            quantity = int(match.group(2))
+        else:
+            parts = content.split()
+            if len(parts) >= 2 and parts[0].isdigit():
+                type_id_str = parts[0]
+                # 检查第二部分是否是数量
+                if parts[1].lower().startswith(('x', '*', '×')):
+                    quantity = int(parts[1][1:]) if len(parts[1]) > 1 else 1
+                elif parts[1].isdigit():
+                    quantity = int(parts[1])
+        
+        try:
+            type_id = int(type_id_str)
+        except ValueError:
+            yield event.plain_result("请提供正确的 Type ID 数字")
+            return
+        
+        # 判断是否为 PLEX
+        is_plex = (type_id == self.PLEX_TYPE_ID)
+        
+        # 选择区域
+        region_id = self.REGION_ID_PLEX_GLOBAL if is_plex else None
+        
+        # 查询价格
+        unit_sell, unit_buy = self.get_price_by_type_id(type_id, region_id)
+        
+        # 计算总价
+        total_sell = unit_sell * quantity if unit_sell else None
+        total_buy = unit_buy * quantity if unit_buy else None
+        
+        if unit_sell is None and unit_buy is None:
+            yield event.plain_result(f"Type ID {type_id} 在 {'全球市场' if is_plex else 'Jita'} 没有订单")
+            return
+        
+        result_parts = []
+        
+        if quantity > 1:
+            result_parts.append(f"Type ID: {type_id} × {quantity}")
+        else:
+            result_parts.append(f"Type ID: {type_id}")
+        
+        if is_plex:
+            result_parts.append("市场: PLEX 全球统一市场")
+        else:
+            result_parts.append("市场: Jita (The Forge)")
+        
+        if total_sell is not None:
+            result_parts.append(f"💰 最低卖价: {total_sell:,.2f} ISK")
+            if quantity > 1 and unit_sell:
+                result_parts.append(f"   (单价: {unit_sell:,.2f} ISK)")
+        else:
+            result_parts.append(f"💰 最低卖价: 无")
+        
+        if total_buy is not None:
+            result_parts.append(f"💎 最高买价: {total_buy:,.2f} ISK")
+            if quantity > 1 and unit_buy:
+                result_parts.append(f"   (单价: {unit_buy:,.2f} ISK)")
+        else:
+            result_parts.append(f"💎 最高买价: 无")
+        
+        if total_sell is not None and total_buy is not None and total_sell > total_buy:
+            spread = total_sell - total_buy
+            spread_percent = (spread / total_buy) * 100
+            result_parts.append(f"📊 差价: {spread:,.2f} ISK ({spread_percent:.1f}%)")
+        
+        yield event.plain_result("\n".join(result_parts))
