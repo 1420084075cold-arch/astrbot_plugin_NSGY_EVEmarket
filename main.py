@@ -308,61 +308,63 @@ class MyPlugin(Star):
         # 判断是否为 PLEX
         is_plex = item_name.lower() == "plex" or type_id == self.PLEX_TYPE_ID
         
-        # 获取单价用于显示
-        unit_sell = total_sell / quantity if total_sell else None
-        unit_buy = total_buy / quantity if unit_buy else None
-        
-        # 记录日志
-        logger.info(f"查询物品: {item_name} (type_id={type_id}, 数量={quantity}, is_plex={is_plex})")
-        
-        # 构建回复消息
+        # 检查是否有订单
         if total_sell is None and total_buy is None:
             if is_plex:
                 yield event.plain_result(f"PLEX 在全球市场当前没有订单，请稍后再试。")
             else:
                 yield event.plain_result(f"「{item_name}」在 Jita 当前没有订单。")
+            return
+        
+        # 计算单价（只有在有订单的情况下才计算）
+        unit_sell = total_sell / quantity if total_sell else None
+        unit_buy = total_buy / quantity if total_buy else None
+        
+        # 记录日志
+        logger.info(f"查询物品: {item_name} (type_id={type_id}, 数量={quantity}, is_plex={is_plex})")
+        
+        # 构建回复消息
+        result_parts = []
+        
+        # 物品名称和数量
+        if quantity > 1:
+            result_parts.append(f"物品: {item_name} × {quantity}")
         else:
-            result_parts = []
-            
-            # 物品名称和数量
-            if quantity > 1:
-                result_parts.append(f"物品: {item_name} × {quantity}")
-            else:
-                result_parts.append(f"物品: {item_name}")
-            
-            # 市场类型
-            if is_plex:
-                result_parts.append("市场: PLEX 全球统一市场")
-            else:
-                result_parts.append("市场: Jita (The Forge)")
-            
-            # 卖价
-            if total_sell is not None:
-                result_parts.append(f"💰 最低卖价: {total_sell:,.2f} ISK")
-                if quantity > 1 and unit_sell:
-                    result_parts.append(f"   (单价: {unit_sell:,.2f} ISK)")
-            else:
-                result_parts.append(f"💰 最低卖价: 无")
-            
-            # 买价
-            if total_buy is not None:
-                result_parts.append(f"💎 最高买价: {total_buy:,.2f} ISK")
-                if quantity > 1 and unit_buy:
-                    result_parts.append(f"   (单价: {unit_buy:,.2f} ISK)")
-            else:
-                result_parts.append(f"💎 最高买价: 无")
-            
-            # 计算差价（如果有买卖双方价格）
-            if total_sell is not None and total_buy is not None and total_sell > total_buy:
-                spread = total_sell - total_buy
-                spread_percent = (spread / total_buy) * 100
-                result_parts.append(f"📊 差价: {spread:,.2f} ISK ({spread_percent:.1f}%)")
-            
-            # 如果是模糊搜索匹配的，添加提示
-            if fuzzy_results and len(fuzzy_results) > 0:
-                result_parts.append(f"\n💡 提示: 这是模糊搜索匹配到的结果，如需精确查询请使用完整名称。")
-            
-            yield event.plain_result("\n".join(result_parts))
+            result_parts.append(f"物品: {item_name}")
+        
+        # 市场类型
+        if is_plex:
+            result_parts.append("市场: PLEX 全球统一市场")
+        else:
+            result_parts.append("市场: Jita (The Forge)")
+        
+        # 卖价
+        if total_sell is not None:
+            result_parts.append(f"💰 最低卖价: {total_sell:,.2f} ISK")
+            if quantity > 1 and unit_sell:
+                result_parts.append(f"   (单价: {unit_sell:,.2f} ISK)")
+        else:
+            result_parts.append(f"💰 最低卖价: 无")
+        
+        # 买价
+        if total_buy is not None:
+            result_parts.append(f"💎 最高买价: {total_buy:,.2f} ISK")
+            if quantity > 1 and unit_buy:
+                result_parts.append(f"   (单价: {unit_buy:,.2f} ISK)")
+        else:
+            result_parts.append(f"💎 最高买价: 无")
+        
+        # 计算差价（如果有买卖双方价格）
+        if total_sell is not None and total_buy is not None and total_sell > total_buy:
+            spread = total_sell - total_buy
+            spread_percent = (spread / total_buy) * 100
+            result_parts.append(f"📊 差价: {spread:,.2f} ISK ({spread_percent:.1f}%)")
+        
+        # 如果是模糊搜索匹配的，添加提示
+        if fuzzy_results and len(fuzzy_results) > 0:
+            result_parts.append(f"\n💡 提示: 这是模糊搜索匹配到的结果，如需精确查询请使用完整名称。")
+        
+        yield event.plain_result("\n".join(result_parts))
     
     @filter.command(".jitaid")
     async def jita_by_id(self, event: AstrMessageEvent, type_id_str: str):
